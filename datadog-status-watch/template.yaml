@@ -1,0 +1,83 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Datadog global service status and notify via SNS when degraded.
+
+Parameters:
+  ScheduleExpression:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge schedule expression.
+  DatadogStatusUrl:
+    Type: String
+    Default: https://status.datadoghq.com/api/v2/status.json
+    Description: Datadog Status API v2 endpoint.
+  SnsEmailSubscription:
+    Type: String
+    Default: ''                       # ← 空だとサブスクリプションはは作られない
+    Description: (Optional) Email address to subscribe to the SNS topic automatically.
+    AllowedPattern: '^$|[^@]+@[^@]+\.[^@]+$'
+
+Conditions:
+  HasEmailSubscription: !Not [ !Equals [ !Ref SnsEmailSubscription, '' ] ]   # メールアドレスを指定すればサブスクリプションを作る、空だとリソースを作らない
+
+Globals:
+  Function:
+    Runtime: python3.13
+    MemorySize: 256
+    Timeout: 60
+    Tracing: Active
+    Environment:
+      Variables:
+        STATUS_URL: !Ref DatadogStatusUrl
+        LOG_LEVEL: INFO
+
+Resources:
+  DatadogStatusTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: datadog-status-alerts
+
+  DatadogStatusTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmailSubscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref SnsEmailSubscription
+      TopicArn: !Ref DatadogStatusTopic
+
+  DatadogStatusChecker:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: datadog-status-checker
+      Handler: src.app.lambda_handler
+      Description: Checks Datadog Status API and notifies when degraded/partial outage.
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref DatadogStatusTopic
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref DatadogStatusTopic
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: !Ref ScheduleExpression
+            Name: datadog-status-schedule
+            Description: Periodic Datadog status check
+
+Conditions:
+  HasEmailSubscription: !Not [!Equals [!Ref SnsEmailSubscription, ""]]
+
+Outputs:
+  TopicArn:
+    Description: SNS Topic ARN for Datadog status alerts
+    Value: !Ref DatadogStatusTopic
+  FunctionName:
+    Description: Lambda Function Name
+    Value: !Ref DatadogStatusChecker
+  Schedule:
+    Description: EventBridge Schedule Expression
+    Value: !Ref ScheduleExpression
