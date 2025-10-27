@@ -206,3 +206,4 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 .aws-sam/build.toml
+datadog-status-watch/.aws-sam/build.toml
