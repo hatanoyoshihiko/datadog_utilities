@@ -25,7 +25,7 @@ HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))           # 既定: 3
 BACKOFF_BASE_SEC = float(os.getenv("BACKOFF_BASE_SEC", "1.2"))       # バックオフ倍率
 
 # 重複抑止（同一内容の連投防止）
-DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "10"))  # 10分間は同一シグネチャなら抑止
+DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "60"))  # 60分間は同一シグネチャなら抑止
 DEDUP_PATH = "/tmp/dd_status_last_sig.json"
 
 # ログ
