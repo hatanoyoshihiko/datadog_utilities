@@ -1,3 +1,4 @@
+# src/app.py
 import json
 import os
 import logging
@@ -7,193 +8,210 @@ import time
 import random
 import socket
 import ssl
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+import hashlib
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional
 
-# ---- ログ設定 ----
+# =========================
+# 設定（環境変数）
+# =========================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+STATUS_URL = os.getenv("STATUS_URL", "https://status.datadoghq.com/api/v2/status.json")
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")  # 未設定なら通知しない（ログのみ）
+
+# ネットワーク系
+HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "6"))   # 既定: 6秒
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))           # 既定: 3回
+BACKOFF_BASE_SEC = float(os.getenv("BACKOFF_BASE_SEC", "1.2"))       # バックオフ倍率
+
+# 重複抑止（同一内容の連投防止）
+DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "10"))  # 10分間は同一シグネチャなら抑止
+DEDUP_PATH = "/tmp/dd_status_last_sig.json"
+
+# ログ
 logger = logging.getLogger()
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 
-# ---- 設定 ----
-# Datadog ステータス API（サマリー。未解決インシデント/コンポーネント情報を含む）
-STATUS_URL = os.getenv("STATUS_URL", "https://status.datadoghq.com/api/v2/summary.json")
-SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
+# =========================
+# ユーティリティ
+# =========================
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
-# リトライ関連（必要に応じて環境変数で調整）
-HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "3"))   # 1回あたりのタイムアウト
-HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))            # リトライ回数
-BACKOFF_BASE_SEC = float(os.getenv("BACKOFF_BASE_SEC", "0.5"))        # バックオフ基準
-BACKOFF_CAP_SEC = float(os.getenv("BACKOFF_CAP_SEC", "3.0"))          # バックオフ上限
+def _jitter(sec: float) -> float:
+    # 0.8〜1.2倍程度のジッター
+    return sec * random.uniform(0.8, 1.2)
 
-import boto3
-sns = boto3.client("sns")
-
-
-# ---- ユーティリティ ----
-def _is_timeout_error(err: Exception) -> bool:
-    """タイムアウト系の例外かどうかを緩やかに判定"""
-    if isinstance(err, TimeoutError):
-        return True
-    if isinstance(err, socket.timeout):
-        return True
-    if isinstance(err, urllib.error.URLError) and isinstance(getattr(err, "reason", None), socket.timeout):
-        return True
-    if isinstance(err, ssl.SSLError) and "timed out" in str(err).lower():
-        return True
-    return False
-
+def _read_text(url: str, timeout: int) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "dd-status-check/status-json/1.0",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if resp.status != 200:
+            raise urllib.error.HTTPError(url, resp.status, f"HTTP {resp.status}", resp.headers, None)
+        return resp.read().decode("utf-8")
 
 def _fetch_status_with_retry(url: str) -> Dict[str, Any]:
-    """短いタイムアウト＋指数バックオフで summary.json を取得"""
-    last_err: Exception | None = None
+    last_err: Optional[Exception] = None
     for attempt in range(1, HTTP_MAX_RETRIES + 1):
         try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "dd-status-check/1.0",
-                    "Accept": "application/json",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(f"HTTP {resp.status}")
-                data = resp.read().decode("utf-8")
-                return json.loads(data)
-
-        except Exception as e:
+            body = _read_text(url, HTTP_TIMEOUT_SECONDS)
+            return json.loads(body)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, socket.timeout, ssl.SSLError) as e:
             last_err = e
-            # タイムアウト系のみリトライ。それ以外は即時スロー
-            if not _is_timeout_error(e):
-                raise
-
             if attempt < HTTP_MAX_RETRIES:
-                backoff = min(BACKOFF_BASE_SEC * (2 ** (attempt - 1)) + random.uniform(0, 0.2), BACKOFF_CAP_SEC)
-                logger.warning(f"Timeout on attempt {attempt}/{HTTP_MAX_RETRIES}. Retrying in {backoff:.2f}s ...")
-                time.sleep(backoff)
+                sleep_sec = _jitter(BACKOFF_BASE_SEC ** attempt)
+                logger.warning(f"[attempt {attempt}/{HTTP_MAX_RETRIES}] fetch failed: {e} -> sleep {sleep_sec:.2f}s")
+                time.sleep(sleep_sec)
             else:
-                break
+                logger.error(f"[attempt {attempt}/{HTTP_MAX_RETRIES}] fetch failed. giving up: {e}")
+    # 到達したら最終エラー
+    raise last_err or RuntimeError("unknown fetch error")
 
-    # ここまで来たら失敗を投げる
-    assert last_err is not None
-    raise last_err
+def _fmt_dt(s: Optional[str]) -> str:
+    if not s:
+        return "-"
+    try:
+        # Statuspage は ISO8601（Z）想定
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%Y-%m-%d %H:%M:%SZ")  # UTC表記
+    except Exception:
+        return s
 
+def _build_alert_subject(indicator: str, description: str) -> str:
+    # 件名は「[Datadog Status] <description>」に統一
+    desc = description or indicator or "Status changed"
+    return f"[Datadog Status] {desc}"
 
-# ---- アラート判定（summary.json 専用）----
-def _should_alert_summary(payload: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """
-    summary.json を前提。
-    戻り値: (alert, summary_info)
-      summary_info = {
-        "indicator": str,               # ページの総合指標（none/ minor/ major/ critical）
-        "description": str,             # ページの説明
-        "page_updated_at": str | None,  # ページ更新時刻
-        "incidents": [ { name, impact, status, shortlink, latest_update_body, latest_update_at } ],
-        "degraded_components": [ { name, status } ],
-      }
-    """
-    status = payload.get("status", {}) or {}
-    indicator = status.get("indicator", "unknown")
-    description = status.get("description", "No description")
+def _build_alert_body(payload: Dict[str, Any], fetched_at: datetime) -> str:
+    # /api/v2/status.json の内容をそのまま分かりやすく整形
+    page = payload.get("page", {})
+    status = payload.get("status", {})
+    indicator = (status.get("indicator") or "-")
+    description = (status.get("description") or "-")
+    page_updated = _fmt_dt(page.get("updated_at"))
 
-    # 未解決インシデントを抽出
-    incidents_out: List[Dict[str, Any]] = []
-    for inc in (payload.get("incidents") or []):
-        updates = inc.get("incident_updates") or []
-        latest = None
-        if updates:
-            # created_at の最大を最新とみなす（文字列ISO想定）
-            latest = max(updates, key=lambda u: u.get("created_at") or "")
-        incidents_out.append({
-            "name": inc.get("name"),
-            "impact": inc.get("impact"),
-            "status": inc.get("status"),
-            "shortlink": inc.get("shortlink"),
-            "latest_update_body": (latest or {}).get("body"),
-            "latest_update_at": (latest or {}).get("created_at"),
-        })
+    lines = []
+    lines.append(f"Fetched at (UTC): {_fmt_dt(fetched_at.isoformat())}")
+    lines.append("")
+    lines.append("=== Status ===")
+    lines.append(f"indicator: {indicator}")         # none / minor / major / critical 等
+    lines.append(f"description: {description}")     # All Systems Operational / Partial Outage 等
+    lines.append("")
+    lines.append("=== Page ===")
+    lines.append(f"name: {page.get('name') or '-'}")
+    lines.append(f"url:  {page.get('url') or '-'}")
+    lines.append(f"updated_at: {page_updated}")
+    lines.append("")
+    lines.append("------------------------------------------------------------")
+    lines.append("This email was sent by the Datadog status (status.json) watcher.")
+    return "\n".join(lines)
 
-    # 劣化/障害中コンポーネントを抽出
-    bad_statuses = {"degraded_performance", "partial_outage", "major_outage"}
-    degraded_components = [
-        {"name": c.get("name"), "status": c.get("status")}
-        for c in (payload.get("components") or [])
-        if c.get("status") in bad_statuses
-    ]
+def _hash_signature(subject: str, body: str) -> str:
+    h = hashlib.sha256()
+    h.update(subject.encode("utf-8"))
+    h.update(b"\n\n")
+    h.update(body.encode("utf-8"))
+    return h.hexdigest()
 
-    # 通知判定：indicator != none または 未解決インシデントが1件以上
-    alert = (indicator != "none") or (len(incidents_out) > 0)
+def _load_last_sig() -> Optional[Dict[str, Any]]:
+    try:
+        with open(DEDUP_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
-    summary_info = {
-        "indicator": indicator,
-        "description": description,
-        "page_updated_at": (payload.get("page") or {}).get("updated_at"),
-        "incidents": incidents_out,
-        "degraded_components": degraded_components,
-    }
-    return alert, summary_info
+def _save_last_sig(sig: str, ts: datetime) -> None:
+    payload = {"sig": sig, "ts": ts.isoformat()}
+    try:
+        with open(DEDUP_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except Exception as e:
+        logger.warning(f"failed to write dedup file: {e}")
 
+def _should_suppress(sig: str, ttl_min: int) -> bool:
+    data = _load_last_sig()
+    if not data:
+        return False
+    if data.get("sig") != sig:
+        return False
+    try:
+        ts = datetime.fromisoformat(data.get("ts"))
+    except Exception:
+        return False
+    return (_now_utc() - ts) < timedelta(minutes=ttl_min)
 
-# ---- 通知（障害のみ）----
-def _publish_incident_alert(summary_info: Dict[str, Any], raw_payload: Dict[str, Any]) -> None:
-    """障害情報のみを SNS に通知。FETCH_ERROR はここでは扱わない"""
+def _publish_sns(subject: str, message: str) -> None:
     if not SNS_TOPIC_ARN:
-        logger.warning("SNS_TOPIC_ARN not set. Skipping SNS publish.")
+        logger.warning("SNS_TOPIC_ARN not set. Skipping publish.")
         return
+    import boto3
+    sns = boto3.client("sns")
+    resp = sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
+    logger.info(f"SNS published: MessageId={resp.get('MessageId')}")
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    subject = f"[Datadog Status] {summary_info['indicator'].upper()}: {summary_info['description']} (incidents: {len(summary_info['incidents'])})"
+# =========================
+# 判定ロジック（status.json 専用）
+# =========================
+def _is_alert_status(payload: Dict[str, Any]) -> bool:
+    """
+    /api/v2/status.json の 'status.indicator' を基準に判定する。
+    - 'none' は「オールグリーン」 → 通知しない
+    - それ以外（minor / major / critical 等） → 通知する
+    """
+    status = payload.get("status") or {}
+    indicator = (status.get("indicator") or "").lower().strip()
+    return indicator != "none" and indicator != ""
 
-    # メール本文：運用しやすい最小構成（raw は必要なら残す）
-    message = {
-        "timestamp": now_iso,
-        "page_updated_at": summary_info.get("page_updated_at"),
-        "indicator": summary_info["indicator"],
-        "description": summary_info["description"],
-        "unresolved_incidents": summary_info["incidents"],
-        "degraded_components": summary_info["degraded_components"],
-        "source": STATUS_URL,
-        # 解析で使う場合のみ raw を参照。不要ならコメントアウト可。
-        "raw": raw_payload,
-    }
-
-    sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Subject=subject[:100],  # SNS Subject は最大 100 文字
-        Message=json.dumps(message, ensure_ascii=False, indent=2),
-    )
-    logger.info(f"SNS published: {subject}")
-
-
-# ---- Lambda ハンドラ ----
+# =========================
+# Lambda Handler
+# =========================
 def lambda_handler(event, context):
-    start = datetime.now(timezone.utc)
-    logger.info("=== Datadog Status Check started ===")
+    start = _now_utc()
+    logger.info("=== Datadog Status (status.json) check started ===")
+    logger.info(f"URL={STATUS_URL}, retries={HTTP_MAX_RETRIES}, timeout={HTTP_TIMEOUT_SECONDS}s")
 
     try:
         payload = _fetch_status_with_retry(STATUS_URL)
-        alert, summary_info = _should_alert_summary(payload)
 
-        logger.info(
-            f"Datadog summary: indicator={summary_info['indicator']}, "
-            f"desc={summary_info['description']}, incidents={len(summary_info['incidents'])}"
-        )
+        if _is_alert_status(payload):
+            status = payload.get("status") or {}
+            subject = _build_alert_subject(
+                indicator=(status.get("indicator") or ""),
+                description=(status.get("description") or ""),
+            )
+            body = _build_alert_body(payload, fetched_at=start)
+            sig = _hash_signature(subject, body)
 
-        if alert:
-            _publish_incident_alert(summary_info, payload)
+            if _should_suppress(sig, DEDUP_TTL_MIN):
+                logger.info("Duplicate alert within TTL. Suppressing notify.")
+            else:
+                _publish_sns(subject, body)
+                _save_last_sig(sig, _now_utc())
         else:
-            logger.info("No alert. (indicator == 'none' and no unresolved incidents)")
+            logger.info("No alert. (indicator == 'none')")
 
-        elapsed_ms = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
+        elapsed_ms = int((_now_utc() - start).total_seconds() * 1000)
         logger.info(f"=== Check completed successfully ({elapsed_ms} ms) ===")
-        return {"ok": True, **summary_info, "elapsed_ms": elapsed_ms}
+        # 返却値は検証用（運用では CloudWatch Logs を参照）
+        return {
+            "ok": True,
+            "alert": _is_alert_status(payload),
+            "indicator": (payload.get("status") or {}).get("indicator"),
+            "description": (payload.get("status") or {}).get("description"),
+            "elapsed_ms": elapsed_ms,
+        }
 
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, socket.timeout, ssl.SSLError) as e:
-        # ★ 障害以外（ネットワーク/タイムアウト等）は通知しない：ログのみ
+        # 取得失敗は通知しない（要件通り：タイムアウト等は“どうでもいい”）
         logger.error(f"Fetch error ignored for alerting: {e}")
         return {"ok": False, "error": str(e)}
 
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
+        # 予期せぬ例外は失敗として上位に伝播（アラーム等で検知）
         raise
