@@ -10,13 +10,14 @@ import socket
 import ssl
 import hashlib
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # =========================
 # 設定（環境変数）
 # =========================
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-STATUS_URL = os.getenv("STATUS_URL", "https://status.datadoghq.com/api/v2/status.json")
+# summary.json を既定に
+STATUS_URL = os.getenv("STATUS_URL", "https://status.datadoghq.com/api/v2/summary.json")
 SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")  # 未設定なら通知しない（ログのみ）
 
 # ネットワーク系
@@ -24,8 +25,13 @@ HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "6"))   # 既定: 6
 HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))           # 既定: 3回
 BACKOFF_BASE_SEC = float(os.getenv("BACKOFF_BASE_SEC", "1.2"))       # バックオフ倍率
 
+# 検知対象（true のとき components も見る）
+ALERT_ON_COMPONENTS = os.getenv("ALERT_ON_COMPONENTS", "true").lower() in ("1", "true", "yes")
+# under_maintenance は通知しない（必要なら true に）
+ALERT_ON_UNDER_MAINT = os.getenv("ALERT_ON_UNDER_MAINT", "false").lower() in ("1", "true", "yes")
+
 # 重複抑止（同一内容の連投防止）
-DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "60"))  # 60分間は同一シグネチャなら抑止
+DEDUP_TTL_MIN = int(os.getenv("DEDUP_TTL_MIN", "10"))  # 10分間は同一シグネチャなら抑止
 DEDUP_PATH = "/tmp/dd_status_last_sig.json"
 
 # ログ
@@ -46,7 +52,7 @@ def _read_text(url: str, timeout: int) -> str:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "dd-status-check/status-json/1.0",
+            "User-Agent": "dd-status-check/summary-json/1.0",
             "Accept": "application/json",
         },
     )
@@ -82,35 +88,97 @@ def _fmt_dt(s: Optional[str]) -> str:
     except Exception:
         return s
 
-def _build_alert_subject(indicator: str, description: str) -> str:
-    # 件名は「[Datadog Status] <description>」に統一
-    desc = description or indicator or "Status changed"
-    return f"[Datadog Status] {desc}"
+# =========================
+# 解析ロジック（summary.json）
+# =========================
+def _extract_active_incidents(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    incidents:
+      - status: investigating / identified / monitoring / resolved / postmortem
+      - impact: critical / major / minor / none
+    通知対象: status != resolved かつ impact != none
+    """
+    res: List[Dict[str, Any]] = []
+    for inc in payload.get("incidents", []) or []:
+        status = (inc.get("status") or "").lower()
+        impact = (inc.get("impact") or "").lower()
+        if status != "resolved" and impact != "none":
+            res.append(inc)
+    return res
 
-def _build_alert_body(payload: Dict[str, Any], fetched_at: datetime) -> str:
-    # /api/v2/status.json の内容をそのまま分かりやすく整形
-    page = payload.get("page", {})
-    status = payload.get("status", {})
-    indicator = (status.get("indicator") or "-")
-    description = (status.get("description") or "-")
-    page_updated = _fmt_dt(page.get("updated_at"))
+def _extract_degraded_components(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    components:
+      - status: operational / under_maintenance / degraded_performance / partial_outage / major_outage
+    通知対象: operational 以外（under_maintenance は既定で除外）
+    """
+    res: List[Dict[str, Any]] = []
+    for comp in payload.get("components", []) or []:
+        status = (comp.get("status") or "").lower()
+        if status == "operational":
+            continue
+        if status == "under_maintenance" and not ALERT_ON_UNDER_MAINT:
+            continue
+        res.append(comp)
+    return res
 
-    lines = []
+# =========================
+# 通知本文生成
+# =========================
+def _build_alert_subject(incidents: List[Dict[str, Any]], components: List[Dict[str, Any]]) -> str:
+    if incidents:
+        head = incidents[0].get("name") or "Datadog incidents"
+        suffix = f" (+{len(incidents)-1})" if len(incidents) > 1 else ""
+        return f"[Datadog Status] {head}{suffix}"
+    if components:
+        names = ", ".join([c.get("name") or "component" for c in components[:3]])
+        more = f" (+{len(components)-3})" if len(components) > 3 else ""
+        return f"[Datadog Status] Components degraded: {names}{more}"
+    return "[Datadog Status] No issues"
+
+def _build_alert_body(incidents: List[Dict[str, Any]], components: List[Dict[str, Any]], fetched_at: datetime, page: Dict[str, Any]) -> str:
+    lines: List[str] = []
     lines.append(f"Fetched at (UTC): {_fmt_dt(fetched_at.isoformat())}")
     lines.append("")
-    lines.append("=== Status ===")
-    lines.append(f"indicator: {indicator}")         # none / minor / major / critical 等
-    lines.append(f"description: {description}")     # All Systems Operational / Partial Outage 等
-    lines.append("")
-    lines.append("=== Page ===")
-    lines.append(f"name: {page.get('name') or '-'}")
-    lines.append(f"url:  {page.get('url') or '-'}")
-    lines.append(f"updated_at: {page_updated}")
+    if incidents:
+        lines.append("=== Incidents (status != resolved & impact != none) ===")
+        for inc in incidents:
+            name = inc.get("name") or "-"
+            status = inc.get("status") or "-"
+            impact = inc.get("impact") or "-"
+            created = _fmt_dt(inc.get("created_at"))
+            updated = _fmt_dt(inc.get("updated_at"))
+            link = inc.get("shortlink") or inc.get("url") or "-"
+            lines.append(f"- {name}")
+            lines.append(f"  status: {status}, impact: {impact}")
+            lines.append(f"  created_at: {created}, updated_at: {updated}")
+            lines.append(f"  link: {link}")
+            lines.append("")
+    if components:
+        lines.append("=== Components (operational を除く) ===" if not ALERT_ON_UNDER_MAINT else "=== Components (全状態) ===")
+        for comp in components:
+            name = comp.get("name") or "-"
+            status = comp.get("status") or "-"
+            updated = _fmt_dt(comp.get("updated_at") or comp.get("created_at"))
+            lines.append(f"- {name}")
+            lines.append(f"  status: {status}, updated_at: {updated}")
+            lines.append("")
+    if not incidents and not components:
+        lines.append("No active incidents or degraded components detected.")
+    # page 情報（任意）
+    if page:
+        lines.append("=== Page ===")
+        lines.append(f"name: {page.get('name') or '-'}")
+        lines.append(f"url:  {page.get('url') or '-'}")
+        lines.append(f"updated_at: {_fmt_dt(page.get('updated_at'))}")
     lines.append("")
     lines.append("------------------------------------------------------------")
-    lines.append("This email was sent by the Datadog status (status.json) watcher.")
+    lines.append("This email was sent by the Datadog status (summary.json) watcher.")
     return "\n".join(lines)
 
+# =========================
+# 重複抑止
+# =========================
 def _hash_signature(subject: str, body: str) -> str:
     h = hashlib.sha256()
     h.update(subject.encode("utf-8"))
@@ -145,6 +213,9 @@ def _should_suppress(sig: str, ttl_min: int) -> bool:
         return False
     return (_now_utc() - ts) < timedelta(minutes=ttl_min)
 
+# =========================
+# SNS publish
+# =========================
 def _publish_sns(subject: str, message: str) -> None:
     if not SNS_TOPIC_ARN:
         logger.warning("SNS_TOPIC_ARN not set. Skipping publish.")
@@ -155,36 +226,23 @@ def _publish_sns(subject: str, message: str) -> None:
     logger.info(f"SNS published: MessageId={resp.get('MessageId')}")
 
 # =========================
-# 判定ロジック（status.json 専用）
-# =========================
-def _is_alert_status(payload: Dict[str, Any]) -> bool:
-    """
-    /api/v2/status.json の 'status.indicator' を基準に判定する。
-    - 'none' は「オールグリーン」 → 通知しない
-    - それ以外（minor / major / critical 等） → 通知する
-    """
-    status = payload.get("status") or {}
-    indicator = (status.get("indicator") or "").lower().strip()
-    return indicator != "none" and indicator != ""
-
-# =========================
 # Lambda Handler
 # =========================
 def lambda_handler(event, context):
     start = _now_utc()
-    logger.info("=== Datadog Status (status.json) check started ===")
-    logger.info(f"URL={STATUS_URL}, retries={HTTP_MAX_RETRIES}, timeout={HTTP_TIMEOUT_SECONDS}s")
+    logger.info("=== Datadog Status (summary.json) check started ===")
+    logger.info(f"URL={STATUS_URL}, retries={HTTP_MAX_RETRIES}, timeout={HTTP_TIMEOUT_SECONDS}s, components={ALERT_ON_COMPONENTS}")
 
     try:
         payload = _fetch_status_with_retry(STATUS_URL)
 
-        if _is_alert_status(payload):
-            status = payload.get("status") or {}
-            subject = _build_alert_subject(
-                indicator=(status.get("indicator") or ""),
-                description=(status.get("description") or ""),
-            )
-            body = _build_alert_body(payload, fetched_at=start)
+        incidents = _extract_active_incidents(payload)
+        components = _extract_degraded_components(payload) if ALERT_ON_COMPONENTS else []
+        page = payload.get("page") or {}
+
+        if incidents or components:
+            subject = _build_alert_subject(incidents, components)
+            body = _build_alert_body(incidents, components, fetched_at=start, page=page)
             sig = _hash_signature(subject, body)
 
             if _should_suppress(sig, DEDUP_TTL_MIN):
@@ -193,18 +251,11 @@ def lambda_handler(event, context):
                 _publish_sns(subject, body)
                 _save_last_sig(sig, _now_utc())
         else:
-            logger.info("No alert. (indicator == 'none')")
+            logger.info("No alert. (no active incidents / degraded components)")
 
         elapsed_ms = int((_now_utc() - start).total_seconds() * 1000)
         logger.info(f"=== Check completed successfully ({elapsed_ms} ms) ===")
-        # 返却値は検証用（運用では CloudWatch Logs を参照）
-        return {
-            "ok": True,
-            "alert": _is_alert_status(payload),
-            "indicator": (payload.get("status") or {}).get("indicator"),
-            "description": (payload.get("status") or {}).get("description"),
-            "elapsed_ms": elapsed_ms,
-        }
+        return {"ok": True, "incidents": len(incidents), "components": len(components), "elapsed_ms": elapsed_ms}
 
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, socket.timeout, ssl.SSLError) as e:
         # 取得失敗は通知しない（要件通り：タイムアウト等は“どうでもいい”）
