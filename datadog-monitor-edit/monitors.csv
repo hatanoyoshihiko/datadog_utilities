@@ -1,0 +1,3 @@
+monitor_id,evaluate_the,timeframe,evaluation_delay,require_full_window
+204888464,avg,last_2h,900,0
+204886328,avg,,,
