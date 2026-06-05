@@ -1,4 +1,4 @@
-urllib3==2.6.3
+urllib3==2.7.0
 datadog-api-client==2.24.0
 boto3>=1.26.0
 botocore>=1.39.0
